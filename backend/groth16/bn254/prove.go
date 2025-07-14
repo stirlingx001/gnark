@@ -8,6 +8,7 @@ package groth16
 import (
 	"fmt"
 	"math/big"
+	"os"
 	"runtime"
 	"time"
 
@@ -50,6 +51,9 @@ func (proof *Proof) CurveID() ecc.ID {
 
 // Prove generates the proof of knowledge of a r1cs with full witness (secret + public part).
 func Prove(r1cs *cs.R1CS, pk *ProvingKey, fullWitness witness.Witness, opts ...backend.ProverOption) (*Proof, error) {
+	if os.Getenv("DISABLE_GOROUTINE") == "1" {
+		return serialProve(r1cs, pk, fullWitness, opts...)
+	}
 	opt, err := backend.NewProverConfig(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("new prover config: %w", err)
@@ -308,6 +312,227 @@ func Prove(r1cs *cs.R1CS, pk *ProvingKey, fullWitness witness.Witness, opts ...b
 	if err := <-chKrsDone; err != nil {
 		return nil, err
 	}
+
+	log.Debug().Dur("took", time.Since(start)).Msg("prover done")
+
+	return proof, nil
+}
+
+func serialProve(r1cs *cs.R1CS, pk *ProvingKey, fullWitness witness.Witness, opts ...backend.ProverOption) (*Proof, error) {
+
+	fmt.Printf("serialProve\n")
+
+	opt, err := backend.NewProverConfig(opts...)
+	if err != nil {
+		return nil, fmt.Errorf("new prover config: %w", err)
+	}
+	if opt.HashToFieldFn == nil {
+		opt.HashToFieldFn = hash_to_field.New([]byte(constraint.CommitmentDst))
+	}
+
+	log := logger.Logger().With().Str("curve", r1cs.CurveID().String()).Str("acceleration", "none").
+		Int("nbConstraints", r1cs.GetNbConstraints()).Str("backend", "groth16").Logger()
+
+	commitmentInfo := r1cs.CommitmentInfo.(constraint.Groth16Commitments)
+
+	proof := &Proof{Commitments: make([]curve.G1Affine, len(commitmentInfo))}
+
+	solverOpts := opt.SolverOpts[:len(opt.SolverOpts):len(opt.SolverOpts)]
+
+	privateCommittedValues := make([][]fr.Element, len(commitmentInfo))
+
+	// override hints
+	bsb22ID := solver.GetHintID(fcs.Bsb22CommitmentComputePlaceholder)
+	solverOpts = append(solverOpts, solver.OverrideHint(bsb22ID, func(_ *big.Int, in []*big.Int, out []*big.Int) error {
+		i := int(in[0].Int64())
+		in = in[1:]
+		privateCommittedValues[i] = make([]fr.Element, len(commitmentInfo[i].PrivateCommitted))
+		hashed := in[:len(commitmentInfo[i].PublicAndCommitmentCommitted)]
+		committed := in[+len(hashed):]
+		for j, inJ := range committed {
+			privateCommittedValues[i][j].SetBigInt(inJ)
+		}
+
+		var err error
+		if proof.Commitments[i], err = pk.CommitmentKeys[i].Commit(privateCommittedValues[i]); err != nil {
+			return err
+		}
+
+		opt.HashToFieldFn.Write(constraint.SerializeCommitment(proof.Commitments[i].Marshal(), hashed, (fr.Bits-1)/8+1))
+		hashBts := opt.HashToFieldFn.Sum(nil)
+		opt.HashToFieldFn.Reset()
+		nbBuf := fr.Bytes
+		if opt.HashToFieldFn.Size() < fr.Bytes {
+			nbBuf = opt.HashToFieldFn.Size()
+		}
+		var res fr.Element
+		res.SetBytes(hashBts[:nbBuf])
+		res.BigInt(out[0])
+		return nil
+	}))
+
+	_solution, err := r1cs.Solve(fullWitness, solverOpts...)
+	if err != nil {
+		return nil, err
+	}
+
+	solution := _solution.(*cs.R1CSSolution)
+	wireValues := []fr.Element(solution.W)
+
+	start := time.Now()
+	poks := make([]curve.G1Affine, len(pk.CommitmentKeys))
+
+	for i := range pk.CommitmentKeys {
+		var err error
+		if poks[i], err = pk.CommitmentKeys[i].ProveKnowledge(privateCommittedValues[i]); err != nil {
+			return nil, err
+		}
+	}
+	// compute challenge for folding the PoKs from the commitments
+	commitmentsSerialized := make([]byte, fr.Bytes*len(commitmentInfo))
+	for i := range commitmentInfo {
+		copy(commitmentsSerialized[fr.Bytes*i:], wireValues[commitmentInfo[i].CommitmentIndex].Marshal())
+	}
+	challenge, err := fr.Hash(commitmentsSerialized, []byte("G16-BSB22"), 1)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = proof.CommitmentPok.Fold(poks, challenge[0], ecc.MultiExpConfig{NbTasks: 1}); err != nil {
+		return nil, err
+	}
+
+	// H (witness reduction / FFT part)
+	var h []fr.Element
+	{
+		h = computeH(solution.A, solution.B, solution.C, &pk.Domain)
+		solution.A = nil
+		solution.B = nil
+		solution.C = nil
+	}
+
+	// we need to copy and filter the wireValues for each multi exp
+	// as pk.G1.A, pk.G1.B and pk.G2.B may have (a significant) number of point at infinity
+	var wireValuesA, wireValuesB []fr.Element
+	{
+		wireValuesA = make([]fr.Element, len(wireValues)-int(pk.NbInfinityA))
+		for i, j := 0, 0; j < len(wireValuesA); i++ {
+			if pk.InfinityA[i] {
+				continue
+			}
+			wireValuesA[j] = wireValues[i]
+			j++
+		}
+	}
+	{
+		wireValuesB = make([]fr.Element, len(wireValues)-int(pk.NbInfinityB))
+		for i, j := 0, 0; j < len(wireValuesB); i++ {
+			if pk.InfinityB[i] {
+				continue
+			}
+			wireValuesB[j] = wireValues[i]
+			j++
+		}
+	}
+
+	// sample random r and s
+	var r, s big.Int
+	var _r, _s, _kr fr.Element
+	if _, err := _r.SetRandom(); err != nil {
+		return nil, err
+	}
+	if _, err := _s.SetRandom(); err != nil {
+		return nil, err
+	}
+	_kr.Mul(&_r, &_s).Neg(&_kr)
+
+	_r.BigInt(&r)
+	_s.BigInt(&s)
+
+	// computes r[δ], s[δ], kr[δ]
+	deltas := curve.BatchScalarMultiplicationG1(&pk.G1.Delta, []fr.Element{_r, _s, _kr})
+
+	var bs1, ar curve.G1Jac
+
+	// computeBS1
+	{
+		if _, err := bs1.MultiExp(pk.G1.B, wireValuesB, ecc.MultiExpConfig{NbTasks: 1}); err != nil {
+			return nil, err
+		}
+		bs1.AddMixed(&pk.G1.Beta)
+		bs1.AddMixed(&deltas[1])
+	}
+
+	// computeAR1
+	{
+		if _, err := ar.MultiExp(pk.G1.A, wireValuesA, ecc.MultiExpConfig{NbTasks: 1}); err != nil {
+			return nil, err
+		}
+		ar.AddMixed(&pk.G1.Alpha)
+		ar.AddMixed(&deltas[0])
+		proof.Ar.FromJacobian(&ar)
+	}
+
+	// computeKRS
+	{
+		// we could NOT split the Krs multiExp in 2, and just append pk.G1.K and pk.G1.Z
+		// however, having similar lengths for our tasks helps with parallelism
+
+		var krs, krs2, p1 curve.G1Jac
+		sizeH := int(pk.Domain.Cardinality - 1) // comes from the fact the deg(H)=(n-1)+(n-1)-n=n-2
+
+		_, err := krs2.MultiExp(pk.G1.Z, h[:sizeH], ecc.MultiExpConfig{NbTasks: 1})
+		if err != nil {
+			return nil, err
+		}
+
+		// filter the wire values if needed
+		// TODO Perf @Tabaie worst memory allocation offender
+		toRemove := commitmentInfo.GetPrivateCommitted()
+		toRemove = append(toRemove, commitmentInfo.CommitmentIndexes())
+		_wireValues := filterHeap(wireValues[r1cs.GetNbPublicVariables():], r1cs.GetNbPublicVariables(), internal.ConcatAll(toRemove...))
+
+		if _, err = krs.MultiExp(pk.G1.K, _wireValues, ecc.MultiExpConfig{NbTasks: 1}); err != nil {
+			return nil, err
+		}
+		krs.AddMixed(&deltas[2])
+
+		krs.AddAssign(&krs2)
+
+		p1.ScalarMultiplication(&ar, &s)
+		krs.AddAssign(&p1)
+
+		p1.ScalarMultiplication(&bs1, &r)
+		krs.AddAssign(&p1)
+
+		proof.Krs.FromJacobian(&krs)
+	}
+
+	// computeBS2
+	computeBS2 := func() error {
+		// Bs2 (1 multi exp G2 - size = len(wires))
+		var Bs, deltaS curve.G2Jac
+
+		if _, err := Bs.MultiExp(pk.G2.B, wireValuesB, ecc.MultiExpConfig{NbTasks: 1}); err != nil {
+			return err
+		}
+
+		deltaS.FromAffine(&pk.G2.Delta)
+		deltaS.ScalarMultiplication(&deltaS, &s)
+		Bs.AddAssign(&deltaS)
+		Bs.AddMixed(&pk.G2.Beta)
+
+		proof.Bs.FromJacobian(&Bs)
+		return nil
+	}
+
+	// wait for FFT to end, as it uses all our CPUs
+
+	// schedule our proof part computations
+	if err := computeBS2(); err != nil {
+		return nil, err
+	}
+
+	// wait for all parts of the proof to be computed.
 
 	log.Debug().Dur("took", time.Since(start)).Msg("prover done")
 

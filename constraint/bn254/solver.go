@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -421,6 +422,9 @@ func (solver *solver) processInstruction(pi constraint.PackedInstruction, scratc
 // run runs the solver. it return an error if a constraint is not satisfied or if not all wires
 // were instantiated.
 func (solver *solver) run() error {
+	if os.Getenv("DISABLE_GOROUTINE") == "1" {
+		return solver.serialRun()
+	}
 	// minWorkPerCPU is the minimum target number of constraint a task should hold
 	// in other words, if a level has less than minWorkPerCPU, it will not be parallelized and executed
 	// sequentially without sync.
@@ -525,6 +529,25 @@ func (solver *solver) run() error {
 		return errors.New("solver didn't assign a value to all wires")
 	}
 
+	return nil
+}
+
+func (solver *solver) serialRun() error {
+	//fmt.Printf("solver serialRun\n")
+
+	var scratch scratch
+	// for each level, we push the tasks
+	for _, level := range solver.Levels {
+		// we do it sequentially
+		for _, i := range level {
+			if err := solver.processInstruction(solver.Instructions[i], &scratch); err != nil {
+				return err
+			}
+		}
+	}
+	if int(solver.nbSolved) != len(solver.values) {
+		return errors.New("solver didn't assign a value to all wires")
+	}
 	return nil
 }
 
